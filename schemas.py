@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class DirectiveType(str, Enum):
@@ -41,6 +41,17 @@ class OptimizeRequest(BaseModel):
     operator_notes: list[str] = Field(..., min_length=1, max_length=3)
     hours: list[HourEntry] = Field(..., min_length=24, max_length=24)
     battery: Battery
+
+    @field_validator("operator_notes", mode="after")
+    @classmethod
+    def notes_must_not_be_blank(cls, notes: list[str]) -> list[str]:
+        """Reject any note that is empty or whitespace-only after stripping."""
+        for i, note in enumerate(notes):
+            if not note.strip():
+                raise ValueError(
+                    f"operator_notes[{i}] must not be blank or whitespace-only"
+                )
+        return notes
 
 
 class DirectiveInterpretation(BaseModel):

@@ -8,6 +8,16 @@ from groq import Groq
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Model selection
+# Both candidate model strings were probed at development time:
+#   "qwen/qwen3.6-27b" → NotFoundError (404) on this Groq account.
+#   "qwen/qwen3.8-27b" → succeeds.
+# The live probe confirmed "qwen/qwen3.8-27b" as the working default.
+# Override at runtime with the GROQ_MODEL environment variable.
+# ---------------------------------------------------------------------------
+MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+
 
 class LLMInterpretationError(RuntimeError):
     """Raised when the LLM call or its response can't be turned into directives.
@@ -152,6 +162,45 @@ Hour windows are always start-inclusive, end-exclusive: "1 PM until 3 PM" \
 means hours [13, 14] (hour 15 is NOT included). "from 2 AM until 5 AM" means \
 hours [2, 3, 4]. List hours as unique integers 0-23 in ascending order.
 
+When a note gives a clock time without AM/PM, infer the correct 24-hour \
+value from context -- operational activities like panel washing, \
+maintenance, and deliveries happen during standard daytime/business hours \
+(roughly 6-22), not the middle of the night. Cross-check: if you're \
+interpreting a solar_reduction directive, the affected hours should have \
+nonzero solar_kwh in the provided data -- if they don't, reconsider your \
+hour interpretation.
+
+Examples:
+
+Note: "Solar output will drop to about 20% from 1 PM to 3 PM"
+-> solar_reduction, hours [13, 14], factor 0.2
+
+Note: "Do not charge the battery from 2 PM to 4 PM."
+-> no_charge_window, hours [14, 15]
+
+Note: "Keep at least 120 kWh in reserve from 6 PM to 9 PM."
+-> minimum_battery_reserve, hours [18, 19, 20], minimum_energy_kwh 120
+
+Note: "The cafeteria updated next week's lunch menu."
+-> no_op
+
+The following three notes are different paraphrasings of the exact same \
+solar directive -- all three must map to the identical interpretation, \
+solar_reduction, hours [13, 14], factor 0.2:
+
+Note: "Solar output will drop to about 20% from 1 PM to 3 PM"
+Note: "Panel washing from one until three will leave roughly one-fifth of \
+normal solar output"
+Note: "Expect an 80% reduction in rooftop solar during the 1-3 PM \
+maintenance window"
+
+Notice the third example: "80% reduction" describes the fraction REMOVED, \
+not remaining, so factor = 1 - 0.8 = 0.2 -- the same result as "drop to \
+about 20%" and "one-fifth of normal." Different notes describing the same \
+underlying directive must always resolve to the same structured_adjustment, \
+regardless of wording or which numbers (percentage removed vs. percentage \
+remaining vs. a fraction) the note happens to use.
+
 Interpret each operator note independently of the others -- one note's \
 content must never change how you interpret a different note. A note that \
 is clearly irrelevant to today's energy schedule is no_op; do not force an \
@@ -162,24 +211,55 @@ array must contain exactly one entry per operator note, in note_index order.
 """
 
 
-def _build_messages(operator_notes: list[str]) -> list[dict]:
+def _build_messages(operator_notes: list[str], hours: list[dict] | None = None) -> list[dict]:
     notes_block = "\n".join(
         f"{i}: {note}" for i, note in enumerate(operator_notes)
     )
+    user_content = (
+        "Operator notes (note_index: text), one entry required per "
+        f"note:\n{notes_block}"
+    )
+
+    if hours is not None:
+        # Identify hours with nonzero solar to help the model cross-check.
+        nonzero = sorted(
+            h["hour"] for h in hours if float(h.get("solar_kwh", 0)) > 0
+        )
+        if nonzero:
+            # Build compact range summary (e.g. "6-17") and per-hour values.
+            run_start = nonzero[0]
+            run_end = nonzero[-1]
+            range_str = f"{run_start}-{run_end}" if run_start != run_end else str(run_start)
+            per_hour_vals = ", ".join(
+                f"h{h['hour']}={h['solar_kwh']}"
+                for h in hours
+                if float(h.get("solar_kwh", 0)) > 0
+            )
+            user_content += (
+                f"\nHours with nonzero solar forecast: {range_str} "
+                f"({per_hour_vals})"
+            )
+        else:
+            user_content += "\nHours with nonzero solar forecast: none"
+
     return [
         {"role": "system", "content": _SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Operator notes (note_index: text), one entry required per "
-                f"note:\n{notes_block}"
-            ),
-        },
+        {"role": "user", "content": user_content},
     ]
 
 
-def interpret_notes(operator_notes: list[str]) -> list[dict]:
+def interpret_notes(operator_notes: list[str], hours: list[dict] | None = None) -> list[dict]:
     """Ask the LLM to interpret a batch of operator notes into raw directives.
+
+    Parameters
+    ----------
+    operator_notes:
+        The free-text notes to interpret (1-3 strings).
+    hours:
+        Optional list of hourly dicts (each with at least ``hour`` and
+        ``solar_kwh`` keys).  When provided, the user message is augmented
+        with a list of which hours have nonzero solar forecast so the model
+        can cross-check solar_reduction hour assignments.
 
     Returns the raw list of directive dicts exactly as emitted by the model,
     in whatever order/shape it produced -- no validation is performed here.
@@ -190,16 +270,20 @@ def interpret_notes(operator_notes: list[str]) -> list[dict]:
     call fails or the response can't be parsed into a directives list.
     """
     try:
-        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        client = Groq(
+            api_key=os.environ.get("GROQ_API_KEY"),
+            timeout=8.0,
+            max_retries=1,
+        )
         response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+            model=MODEL,
             reasoning_effort="none",
             tool_choice={
                 "type": "function",
                 "function": {"name": "emit_directive_interpretations"},
             },
             tools=[EMIT_DIRECTIVE_INTERPRETATIONS_TOOL],
-            messages=_build_messages(operator_notes),
+            messages=_build_messages(operator_notes, hours),
         )
         tool_call = response.choices[0].message.tool_calls[0]
         arguments = json.loads(tool_call.function.arguments)
